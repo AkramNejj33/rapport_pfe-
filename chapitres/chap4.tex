@@ -164,138 +164,133 @@ La plateforme se décompose en quatre blocs fonctionnels qui s'articulent de man
 
 \subsection{Composants d'intelligence artificielle : vue d'ensemble}
 
-L'intelligence artificielle intervient à trois niveaux distincts dans la plateforme, chacun mobilisant un type de modèle différent et répondant à un besoin précis.
+L'intelligence artificielle intervient à plusieurs niveaux dans la plateforme, tous opérés exclusivement via \textbf{Snowflake Cortex} depuis des requêtes SQL. Cette intégration native garantit que les données ne quittent jamais l'environnement sécurisé Snowflake, ce qui est déterminant dans un contexte de conformité et de gouvernance des données.
 
-Le premier niveau est celui de la \textbf{représentation sémantique}, assuré par un modèle d'embedding de type transformer. Ce modèle transforme chaque ticket, exprimé sous forme de texte libre, en un vecteur dense de 1024 dimensions qui encode son sens sémantique. Deux représentations vectorielles sont calculées par ticket, l'une centrée sur le problème (NOCO) et l'autre sur le contexte de résolution (RICH).
+Quatre fonctions Cortex sont mobilisées de manière combinée tout au long du pipeline :
 
-Le deuxième niveau est celui de la \textbf{classification par similarité}, réalisé sans apprentissage supervisé classique. La prédiction repose sur la recherche des tickets historiques les plus similaires dans l'espace vectoriel, suivie d'un vote pondéré sur leurs étiquettes connues. Cette approche, inspirée des méthodes k-plus-proches-voisins mais opérée dans un espace sémantique dense, tire parti de la totalité de la base d'entraînement sans jamais figer un modèle de classification.
+\begin{itemize}
+    \item \texttt{SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', ...)} pour la summarization technique et l'extraction de mots clés, en raison de son excellent rapport performances/coût sur les tâches de génération structurée en anglais technique.
+    \item \texttt{SNOWFLAKE.CORTEX.EMBED\_TEXT\_768('snowflake-arctic-embed-m', ...)} pour le calcul des vecteurs denses de 768 dimensions, natif à Snowflake et optimisé pour la recherche sémantique.
+    \item \texttt{VECTOR\_COSINE\_SIMILARITY()} pour la recherche des tickets historiques les plus similaires, directement en SQL, sans bibliothèque externe ni infrastructure dédiée.
+    \item \texttt{SNOWFLAKE.CORTEX.COMPLETE('llama3.3-70b', ...)} pour la classification finale par raisonnement few-shot et la génération des résumés correctifs, en raison de sa supériorité sur les prompts complexes avec chain-of-thought.
+\end{itemize}
 
-Le troisième niveau est celui de l'\textbf{arbitrage par grand modèle de langage (LLM)}, activé uniquement pour les cas où la confiance du vote est insuffisante. Le LLM reçoit le ticket ambigu et les candidats proches, raisonne sur leur comparaison et propose une étiquette, dont la validité est ensuite garantie par contrainte syntaxique.
+\subsection{Pipeline de classification RAG sur Snowflake Cortex}
 
-\subsection{Pipeline de classification hybride }
-
-Le pipeline de classification, nommé  Hybrid RCA (Root Cause Analysis), constitue le cœur intelligent du système. Il reçoit en entrée la représentation textuelle d'un ticket et produit une prédiction du type d'incident, une prédiction de la résolution probable, un tag de routage et un résumé correctif. La figure \ref{fig:ml_pipeline} détaille les étapes internes du pipeline.
+Le pipeline de classification constitue le cœur intelligent du système. Il s'articule en cinq étapes séquentielles entièrement implémentées en SQL sur Snowflake, selon une architecture RAG (Retrieval-Augmented Generation) adaptée au contexte du triage de tickets. La figure \ref{fig:rag_archi} illustre le flux global du pipeline.
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=0.85\textwidth]{images/pipeline_ml_v6.png}
-    \caption{Étapes internes du pipeline de classification hybride}
-    \label{fig:ml_pipeline}
+    \includegraphics[width=0.85\textwidth]{images/rag_archi.png}
+    \caption{Pipeline RAG de classification sur Snowflake Cortex}
+    \label{fig:rag_archi}
 \end{figure}
 
-\subsubsection{Le modèle d'embedding : BAAI/bge-large-en-v1.5}
+\subsubsection{Étape 1 — Construction du texte technique enrichi}
 
-Le pipeline repose sur le modèle \texttt{BAAI/bge-large-en-v1.5}, un encodeur de phrases (sentence encoder) basé sur l'architecture transformer BERT, développé par le Beijing Academy of Artificial Intelligence. Ce modèle produit, pour une séquence textuelle de longueur quelconque, un vecteur dense de 1024 dimensions représentant son contenu sémantique.
+La première étape consiste à construire, pour chaque ticket de la base d'entraînement, une représentation textuelle unifiée à partir des sources disponibles. Les modèles dbt de la couche intermédiaire ont déjà produit les colonnes \textit{text\_noco} et \textit{text\_rich}. Ces représentations sont consolidées dans deux colonnes complémentaires utilisées par les étapes suivantes :
 
-Son fonctionnement interne repose sur le mécanisme d'attention multi-têtes propre aux transformers. Chaque token de la séquence d'entrée est mis en relation avec l'ensemble des autres tokens via des calculs d'attention, permettant au modèle de capturer des dépendances longue portée et des nuances contextuelles inaccessibles aux représentations classiques telles que TF-IDF ou les sacs de mots. La représentation finale du ticket est obtenue par un pooling (moyenne pondérée ou token [CLS]) sur les vecteurs de sortie de la dernière couche du transformer.
+\begin{itemize}
+    \item \textbf{INFORMATION\_ONE} : concaténation du résumé nettoyé, de la description et des commentaires agrégés (politique premiers-5 + derniers-3). Cette colonne sert de base pour le calcul des embeddings et les règles de correspondance lexicale.
+    \item \textbf{INFORMATION\_TWO} : version étendue intégrant les métadonnées structurées (priorité, statut, indicateurs de changelog). Cette colonne est injectée dans le contexte du prompt LLM final pour enrichir le raisonnement du modèle.
+\end{itemize}
 
-Le modèle \texttt{bge-large-en-v1.5} a été retenu pour plusieurs raisons convergentes. Premièrement, il figure en tête du classement MTEB (Massive Text Embedding Benchmark) sur les tâches de recherche sémantique en anglais, ce qui est directement pertinent pour la recherche de tickets similaires. Deuxièmement, ses 1024 dimensions correspondent exactement à celles spécifiées dans l'architecture Snowflake Cortex de référence (\texttt{voyage-multilingual-2}), garantissant une compatibilité directe si le déploiement bascule vers le pipeline SQL natif. Troisièmement, il peut s'exécuter localement sur CPU, sans infrastructure GPU, ce qui respecte les contraintes de l'environnement de développement. Quatrièmement, il est distribué sous licence libre via la bibliothèque \textit{sentence-transformers} de Hugging Face, sans coût d'inférence.
+Le recours aux commentaires est motivé par leur richesse informationnelle : les premiers commentaires exposent le contexte de signalement du problème, tandis que les derniers contiennent généralement les éléments menant à la résolution, deux signaux complémentaires pour la prédiction du type d'incident et de la résolution probable.
 
-\subsubsection{Stratégie des embeddings doubles : NOCO et RICH}
+\subsubsection{Étape 2 — Summarization technique et embedding 768 dimensions}
 
-Une innovation centrale du pipeline est l'exploitation de deux représentations vectorielles distinctes pour chaque ticket de la base d'entraînement, reflétant deux perspectives complémentaires sur le même incident.
+La deuxième étape transforme chaque ticket en une représentation vectorielle dense via un processus en deux temps.
 
-\textbf{L'embedding NOCO} (No-Context) est calculé sur la colonne \textit{text\_noco}, une vue minimale du ticket composée du résumé nettoyé, de la priorité, du statut et du reporter. Cette représentation est intentionnellement dépourvue de tout signal lié à la résolution ou aux commentaires. Elle est conçue pour capturer l'essence du problème signalé tel qu'il apparaît au moment de sa création, permettant une recherche fondée sur la nature intrinsèque du ticket.
+\paragraph{Summarization technique par LLM}
 
-\textbf{L'embedding RICH} est calculé sur la colonne \textit{text\_rich}, une vue enrichie intégrant les commentaires agrégés selon la politique premiers-5 + derniers-3, ainsi que les métadonnées structurées numériques. Cette représentation encode le contexte de résolution : les échanges entre contributeurs, les investigations menées, les décisions prises. Elle est conçue pour identifier des tickets qui ont suivi un parcours de résolution similaire, même si leur formulation initiale était différente.
+Avant de calculer l'embedding, une étape de summarization est appliquée via \texttt{CORTEX.COMPLETE('mistral-large2', ...)}. Un prompt personnalisé demande au modèle de supprimer tout le bruit du texte brut (balises HTML, URLs, références de tickets, adresses email) et de produire un résumé technique de 3 à 5 phrases ne conservant que le contenu discriminant : le composant défaillant, le système concerné et le comportement observé.
 
-Pour un nouveau ticket soumis à l'inférence, seul l'embedding NOCO peut être calculé à la volée (les commentaires n'existant pas encore). L'embedding RICH est donc uniquement utilisé côté base d'entraînement, où il contribue à enrichir le voisinage retrouvé par l'embedding NOCO du ticket entrant. Cette asymétrie est délibérée et constitue l'un des apports architecturaux du pipeline.
+Cette étape est préférée à la fonction native \texttt{CORTEX.SUMMARIZE()} car cette dernière est généraliste et conserve les éléments de bruit. Le prompt personnalisé produit un texte standardisé, plus propre pour l'embedding et comparable entre tickets de styles rédactionnels très différents.
 
-\subsubsection{Recherche par similarité cosinus et fusion RRF}
+\paragraph{Calcul des embeddings 768D}
 
-Une fois les deux embeddings NOCO et RICH calculés pour l'ensemble de la base d'entraînement et persistés sous forme de matrices NumPy (\textit{embeddings\_noco.npz} et \textit{embeddings\_rich.npz}), la phase de recherche consiste à trouver les tickets les plus proches du ticket entrant dans chacun des deux espaces vectoriels.
+Le résumé nettoyé est ensuite encodé par le modèle \texttt{snowflake-arctic-embed-m} via la fonction \texttt{CORTEX.EMBED\_TEXT\_768()}, produisant un vecteur de 768 dimensions stocké nativement dans une colonne de type \texttt{VECTOR(FLOAT, 768)} :
 
-La similarité cosinus est utilisée comme métrique de distance. Pour deux vecteurs $\mathbf{a}$ et $\mathbf{b}$ de dimension 1024, elle est définie par :
+\begin{lstlisting}[language=SQL]
+SNOWFLAKE.CORTEX.EMBED_TEXT_768(
+    'snowflake-arctic-embed-m',
+    COALESCE(SUMMARIZED_ONE, LEFT(INFORMATION_ONE, 512))
+) AS EMBEDDING_ONE
+\end{lstlisting}
+
+Le \texttt{COALESCE} protège contre les cas où la summarization échoue, en utilisant directement les 512 premiers caractères du texte brut. Les embeddings calculés constituent la base vectorielle de référence du système RAG.
+
+Le choix du modèle \texttt{snowflake-arctic-embed-m} est justifié par trois facteurs convergents : son intégration native dans Snowflake sans aucun transfert de données, ses 768 dimensions offrant un bon équilibre entre précision sémantique et coût de stockage, et ses performances de premier plan sur les tâches de recherche sémantique en anglais technique.
+
+\subsubsection{Étape 3 — Extraction de mots clés techniques}
+
+La troisième étape enrichit chaque ticket d'un ensemble de mots clés techniques extraits par LLM. Un prompt \texttt{mistral-large2} demande au modèle d'extraire les dix termes les plus discriminants du texte du ticket, en se concentrant sur les noms de technologies, de composants, de types d'erreurs et de systèmes impliqués. Ces mots clés sont ensuite agrégés par catégorie cible (\textit{issuetype\_norm}) pour construire un dictionnaire de signatures textuelles : les termes les plus fréquents dans les tickets d'une catégorie constituent son empreinte lexicale distinctive.
+
+La motivation de cette étape est de corriger un biais structurel de la similarité cosinus : deux tickets peuvent être sémantiquement proches sans partager les mêmes termes techniques discriminants. Un ticket mentionnant un \textit{NullPointerException dans le planificateur de tâches} et un ticket évoquant une \textit{exception dans le gestionnaire de ressources} peuvent avoir une forte similarité vectorielle mais relever de catégories différentes. Les mots clés apportent un signal lexical complémentaire au signal sémantique.
+
+\subsubsection{Étape 4 — Recherche par similarité et re-ranking hybride}
+
+La quatrième étape constitue le cœur du pipeline RAG. Pour chaque ticket de validation, le système recherche les tickets d'entraînement les plus similaires, puis re-ranke les résultats par un score hybride combinant similarité sémantique et correspondance de mots clés.
+
+\paragraph{Recherche par similarité cosinus}
+
+Le ticket de validation est d'abord encodé par le même modèle d'embedding que les tickets d'entraînement, garantissant la cohérence de l'espace vectoriel. Il est ensuite comparé à l'ensemble de la base d'entraînement via \texttt{VECTOR\_COSINE\_SIMILARITY()} en SQL. Pour deux vecteurs $\mathbf{a}$ et $\mathbf{b}$ de dimension 768, la similarité cosinus est définie par :
 
 $$\text{sim}(\mathbf{a}, \mathbf{b}) = \frac{\mathbf{a} \cdot \mathbf{b}}{\|\mathbf{a}\| \cdot \|\mathbf{b}\|}$$
 
-Cette métrique est particulièrement adaptée aux embeddings de transformers, car elle est insensible à la norme des vecteurs et mesure uniquement l'alignement directionnel dans l'espace sémantique.
+Cette métrique est insensible à la norme des vecteurs et mesure uniquement l'alignement directionnel dans l'espace sémantique, ce qui la rend particulièrement robuste aux variations de longueur des textes. Les cinq tickets d'entraînement présentant le score de similarité cosinus le plus élevé sont retenus comme candidats initiaux.
 
-Les deux recherches (NOCO et RICH) produisent deux listes de candidats ordonnées par score décroissant. Ces listes sont ensuite fusionnées par la technique \textbf{Reciprocal Rank Fusion (RRF)}. Pour chaque ticket candidat $d$, son score RRF est calculé comme :
+\paragraph{Re-ranking hybride sémantique + mots clés}
 
-$$\text{RRF}(d) = \sum_{i \in \{\text{NOCO, RICH}\}} \frac{1}{k + r_i(d)}$$
+Le classement initial est ensuite affiné par un score combiné :
 
-où $r_i(d)$ est le rang du candidat $d$ dans la liste $i$ et $k = 60$ est une constante d'amortissement. Cette formulation présente l'avantage d'être robuste aux différences d'échelle entre les scores des deux espaces et de ne pas nécessiter leur normalisation. Les 30 meilleurs candidats selon le score RRF sont retenus pour l'étape suivante.
+$$\text{COMBINED\_SCORE} = (\text{SIMILARITY\_SCORE} \times 0{,}6) + (\text{keyword\_match\_count} \times 0{,}08)$$
 
-\subsubsection{Reclassement par caractéristiques structurées}
+Le \textit{keyword\_match\_count} comptabilise le nombre de mots clés caractéristiques de la catégorie candidate présents dans le texte du ticket à classifier. Ce re-ranking peut inverser le classement initial : un ticket candidat avec une similarité cosinus légèrement inférieure mais partageant davantage de termes techniques discriminants avec la requête remonte dans le classement final.
 
-Un score de fusion final (\textit{fused\_score}) est calculé pour chacun des 30 candidats en combinant le score RRF avec deux signaux supplémentaires issus des couches de transformation :
+\subsubsection{Étape 5 — Classification par LLM avec few-shot dynamique}
 
-\begin{itemize}
-    \item \textbf{Boost de métadonnées} : une similitude est calculée entre le ticket entrant et chaque candidat sur les champs structurés (priorité, statut, reporter). Ce boost récompense les candidats dont le contexte opérationnel est similaire à celui du ticket à analyser.
-    \item \textbf{Similarité de caractéristiques de changelog} : une distance euclidienne normalisée est calculée entre les vecteurs de caractéristiques de changelog (\textit{was\_escalated}, \textit{was\_deescalated}, \textit{n\_assignee\_changes}) du ticket entrant et de chaque candidat, permettant de favoriser les tickets ayant connu des patterns comportementaux similaires.
-\end{itemize}
+La cinquième étape soumet les résultats du re-ranking à \texttt{llama3.3-70b} pour produire la prédiction finale. Le modèle \texttt{llama3.3-70b} est retenu pour sa supériorité sur les prompts complexes avec chain-of-thought par rapport à \texttt{mistral-large2}, et pour sa meilleure capacité à suivre des instructions détaillées portant sur plusieurs catégories avec des règles de désambiguïsation explicites.
 
-Les 15 candidats présentant le meilleur \textit{fused\_score} constituent le voisinage final utilisé pour la prédiction, offrant un équilibre entre pertinence sémantique et cohérence structurelle.
+Un prompt structuré en cinq couches est construit dynamiquement pour chaque ticket :
 
-\subsubsection{Vote pondéré et signaux de confiance}
+\begin{enumerate}
+    \item \textbf{Définitions des catégories} : toutes les valeurs valides de \textit{issuetype\_norm} et \textit{resolution\_norm} avec leur description, permettant au modèle de comprendre les nuances entre catégories voisines (ex : Bug vs Improvement lorsque le ticket propose un correctif).
+    \item \textbf{Règles de désambiguïsation} : construites par analyse des erreurs sur le jeu de validation, ces règles encodent les confusions fréquentes observées empiriquement.
+    \item \textbf{Few-shot dynamique re-ranké} : les cinq exemples issus du re-ranking, présentés avec leurs scores de similarité et de correspondance de mots clés, ainsi que leurs étiquettes cibles connues.
+    \item \textbf{Catégories candidates restreintes} : seules les catégories effectivement représentées dans le top-5 sont soumises au choix du modèle, réduisant l'espace de décision et améliorant la précision.
+    \item \textbf{Chain-of-thought} : une instruction explicite demande au modèle de raisonner en plusieurs étapes avant de formuler sa réponse finale.
+\end{enumerate}
 
-La prédiction est obtenue par un vote pondéré sur les étiquettes des 15 voisins, en utilisant le \textit{fused\_score} comme poids. Ce mécanisme est analogue à un k-NN pondéré, mais opéré dans un espace sémantique riche et avec des poids multi-signaux. Trois indicateurs de confiance sont extraits de la distribution des votes :
+La réponse du modèle est ensuite validée syntaxiquement : si la valeur retournée ne correspond pas exactement à l'une des catégories valides, un mécanisme de normalisation par correspondance partielle (\texttt{ILIKE}) la corrige vers la catégorie la plus proche, garantissant que la sortie finale est toujours une étiquette reconnue.
 
-\begin{itemize}
-    \item \textbf{l0\_conf} : part du vote cumulé détenue par la classe prédite. Une valeur de 0,72 signifie que la classe gagnante concentre 72\% du vote total pondéré.
-    \item \textbf{l0\_div} : score de diversité défini comme $1 - H_{\text{norm}}$, où $H_{\text{norm}}$ est l'entropie normalisée de la distribution des votes. Une valeur proche de 1 traduit un consensus fort, une valeur proche de 0 une distribution diffuse.
-    \item \textbf{margin} : écart normalisé entre la classe gagnante et la deuxième classe, défini comme $\frac{v_1 - v_2}{v_{\text{total}}}$. Ce signal capture le caractère décisif du vote indépendamment du niveau absolu de confiance.
-\end{itemize}
+\subsection{Génération des résumés correctifs}
 
-\subsection{Mécanisme de routage par confiance}
+Pour chaque ticket classifié, le pipeline génère un résumé correctif de 1 à 2 phrases décrivant l'analyse de la cause probable de l'incident. Ce résumé est généré par \texttt{llama3.3-70b} dans une requête séparée, \textit{après} que la classification est définitivement fixée. Cette séquentialité est délibérée : générer le résumé dans la même requête que la classification créerait un biais circulaire où le modèle pourrait être influencé par le résumé qu'il est en train de produire, au détriment de la fiabilité de l'étiquette prédite.
 
-Le mécanisme de routage constitue l'élément différenciateur de l'architecture par rapport aux approches de classification classiques. Son principe est de moduler dynamiquement le recours au modèle de langage selon la fiabilité estimée du vote par similarité, évitant ainsi les appels LLM coûteux lorsque la réponse est évidente, tout en garantissant la qualité des prédictions sur les cas ambigus.
-
-\subsubsection{Décision de routage}
-
-Lorsque les trois signaux de confiance \textit{l0\_conf}, \textit{l0\_div} et \textit{margin} sont simultanément supérieurs à leurs seuils respectifs, calibrés sur l'ensemble de validation, la prédiction est émise directement avec le tag \textbf{DIRECT}. Le ticket est considéré comme suffisamment ancré dans un voisinage homogène pour que le vote seul soit fiable.
-
-Dans le cas contraire, le ticket est marqué \textbf{LLM\_REQUIRED} et transmis au module d'arbitrage par grand modèle de langage. Cette situation survient typiquement lorsque les 15 voisins sont répartis entre plusieurs classes sans majorité claire, ou lorsque le ticket est sémantiquement éloigné de tous les exemples connus.
-
-\subsubsection{Arbitrage par modèle de langage}
-
-Le module d'arbitrage (\textit{cortex/arbitration.py}) met en œuvre une stratégie de few-shot prompting pour solliciter le raisonnement du LLM. Le prompt soumis au modèle comprend :
-
-\begin{itemize}
-    \item Le texte nettoyé du ticket à classifier (résumé + description).
-    \item Les cinq candidats les plus proches avec leurs étiquettes de type et de résolution, ainsi que leurs résumés correctifs (\textit{fix\_summary}).
-    \item L'ensemble des étiquettes valides entre lesquelles le modèle doit choisir.
-    \item Une instruction explicite de répondre uniquement par une étiquette de la liste fournie.
-\end{itemize}
-
-La réponse brute du modèle est ensuite normalisée vers l'ensemble valide d'étiquettes par \textbf{distance d'édition} (algorithme de Levenshtein via la bibliothèque \textit{rapidfuzz}). Cette étape de contrainte syntaxique est essentielle car elle garantit que la sortie du LLM correspond toujours à une catégorie reconnue, même si le modèle introduit une faute de frappe ou une légère reformulation. La prédiction résultante est taggée \textbf{LLM\_ARBITRATED}.
-
-\subsubsection{Client LLM agnostique au backend}
-
-Le client LLM (\textit{cortex/llm\_client.py}) est conçu pour être agnostique au backend d'inférence. Il implémente une logique de basculement automatique : en l'absence de clé API Anthropic, le modèle \texttt{mistral:7b} est sollicité via Ollama en mode local, permettant un fonctionnement entièrement hors ligne sans coût d'inférence. Si la variable d'environnement \texttt{ANTHROPIC\_API\_KEY} est configurée, le client bascule vers l'API Anthropic avec le modèle \texttt{claude-haiku-4-5}, offrant une capacité de raisonnement supérieure pour les cas les plus complexes. Cette architecture agnostique garantit la reproductibilité du pipeline indépendamment de l'infrastructure disponible.
-
-\subsection{Génération de résumés correctifs par LLM}
-
-Pour chaque prédiction, le système génère un résumé correctif court (\textit{fix\_summary}) décrivant en une à deux phrases comment des tickets similaires ont été résolus dans le passé. Ce composant (\textit{cortex/fix\_summary.py}) mobilise le LLM pour synthétiser, à partir du texte et des métadonnées d'un ticket d'entraînement déjà résolu, l'essentiel de la démarche de correction.
-
-La génération suit une stratégie \textbf{paresseuse et mise en cache}. Les résumés ne sont générés que pour les tickets effectivement récupérés lors d'une requête d'inférence, évitant ainsi de prétraiter l'ensemble des 45 000 tickets d'entraînement. Une fois généré, chaque résumé est persisté dans un fichier JSON local (\textit{results/fix\_summaries.json}) et dans la table Snowflake \textit{CORTEX.TRAIN\_ENRICHED}. Lors des requêtes suivantes, les résumés déjà calculés sont servis depuis le cache sans appel supplémentaire au LLM.
-
-Cette conception permet d'enrichir progressivement la base de connaissances au fil des utilisations, tout en maintenant un coût d'inférence LLM proportionnel à l'activité réelle de la plateforme et non au volume total des données d'entraînement.
+Le prompt de génération reçoit le type d'incident prédit, le texte du ticket, le domaine applicatif et la priorité. Il est instruit de commencer par \textit{«~L'incident a été causé par...~»} et de mentionner le composant ou le module spécifique impliqué. La concision maximale (1-2 phrases) garantit des résumés directement exploitables par les équipes de développement, sans nécessiter de reformulation.
 
 \subsection{Couche de restitution}
 
-La plateforme expose deux applications Streamlit conteneurisées via Docker, chacune répondant à un profil d'usage distinct.
+La plateforme expose deux applications Streamlit pour la restitution des résultats aux utilisateurs finaux.
 
-\subsubsection{Application d'inférence en temps réel}
+\subsubsection{Application de triage en temps réel}
 
-L'application d'inférence (\textit{apps/inference/}), accessible sur le port 8501, permet le triage en temps réel d'un nouveau ticket. L'utilisateur saisit le résumé, la description, la priorité et le statut du ticket. L'application effectue une validation des entrées, calcule les embeddings NOCO et RICH à la volée, exécute le pipeline de recherche et de vote, et affiche la prédiction du type et de la résolution avec le tag de routage (DIRECT ou LLM\_ARBITRATED) et le niveau de confiance sous forme numérique et visuelle. Un panneau dédié présente les résumés correctifs des tickets les plus proches, offrant aux développeurs un point de départ concret pour la résolution du problème signalé.
+L'application d'inférence, accessible sur le port 8501, permet le triage en temps réel d'un nouveau ticket. L'utilisateur saisit le résumé et la description du ticket. L'application appelle le pipeline Cortex SQL, puis affiche la prédiction du type d'incident, la résolution probable et le résumé correctif. Un panneau dédié présente les tickets historiques les plus similaires avec leurs scores de similarité et de correspondance de mots clés, offrant aux développeurs un point de départ concret pour la résolution du problème signalé.
 
 \subsubsection{Tableau de bord analytique}
 
-L'application analytique (\textit{apps/analytics/}), accessible sur le port 8502, est une application multi-pages permettant l'exploration des données opérationnelles historiques. Elle est structurée en cinq pages complémentaires :
+L'application analytique, accessible sur le port 8502, est une application multi-pages permettant l'exploration des données opérationnelles historiques. Elle est structurée en cinq pages complémentaires alimentées par les tables \textit{MART\_ANALYTICS\_OPS}, \textit{MART\_ANALYTICS\_WORKLOAD} et \textit{MART\_ANALYTICS\_LINKS} :
 
 \begin{itemize}
-    \item \textbf{Page 1 — Vue d'ensemble} : évolution mensuelle du volume de tickets et répartition par type d'incident, alimentée par \textit{MART\_ANALYTICS\_OPS}.
-    \item \textbf{Page 2 — Résolution} : analyse des délais de résolution et de la distribution des motifs de clôture.
-    \item \textbf{Page 3 — Charge de travail} : tableau de bord par assignataire (volume, délai médian, taux de clôture), exploitant \textit{MART\_ANALYTICS\_WORKLOAD}.
-    \item \textbf{Page 4 — Relations} : exploration des liens entre tickets et identification des composants les plus bloquants, exploitant \textit{MART\_ANALYTICS\_LINKS}.
-    \item \textbf{Page 5 — Anomalies} : détection de tickets présentant des patterns de changelog anormaux (forte rotation d'assignataires, reversals d'escalade de priorité, délais de résolution atypiques).
+    \item \textbf{Page 1 — Vue d'ensemble} : évolution mensuelle du volume de tickets et répartition par type d'incident.
+    \item \textbf{Page 2 — Résolution} : analyse des délais de résolution et distribution des motifs de clôture.
+    \item \textbf{Page 3 — Charge de travail} : tableau de bord par assignataire (volume, délai médian, taux de clôture).
+    \item \textbf{Page 4 — Relations} : exploration des liens entre tickets et identification des composants les plus bloquants.
+    \item \textbf{Page 5 — Anomalies} : détection de tickets présentant des patterns de changelog anormaux (forte rotation d'assignataires, escalades de priorité, délais de résolution atypiques).
 \end{itemize}
-
-Toutes les requêtes Snowflake sont mises en cache avec un TTL d'une heure via le décorateur \texttt{@st.cache\_data(ttl=3600)}, afin de limiter la consommation de crédits du compte d'essai Snowflake tout en maintenant une expérience utilisateur fluide.
 
 %--------------------------5-----------------------------
 \section{Conclusion}
 
-Ce chapitre a posé les fondations de la conception de la plateforme de triage automatique. Nous avons présenté le jeu de données Apache JIRA dans sa structure, son volume et ses spécificités, avant de décrire en détail le processus de transformation qui, à travers l'architecture en médaillon pilotée par dbt, produit des tables de consommation fiables et validées par plus de 50 tests automatisés. Nous avons ensuite décrit l'architecture générale du système et détaillé les trois niveaux d'intervention de l'intelligence artificielle : la représentation sémantique dense par le modèle d'embedding \texttt{bge-large-en-v1.5}, la classification par similarité vectorielle avec fusion RRF et vote pondéré, et l'arbitrage par modèle de langage pour les cas ambigus. Le chapitre suivant sera consacré à la réalisation et à la mise en œuvre de cette architecture, en présentant les aspects d'implémentation et les résultats obtenus sur l'ensemble de test.
+Ce chapitre a posé les fondations de la conception de la plateforme de triage automatique. Nous avons présenté le jeu de données Apache JIRA dans sa structure, son volume et ses spécificités, avant de décrire en détail le processus de transformation qui, à travers l'architecture en médaillon pilotée par dbt, produit des tables de consommation fiables et validées par plus de 50 tests automatisés. Nous avons ensuite décrit l'architecture générale du système et détaillé le pipeline RAG implémenté entièrement sur Snowflake Cortex : summarization par \texttt{mistral-large2}, embedding 768 dimensions par \texttt{snowflake-arctic-embed-m}, re-ranking hybride sémantique et mots clés, classification few-shot par \texttt{llama3.3-70b} avec chain-of-thought, et génération de résumés correctifs. Le chapitre suivant sera consacré à la réalisation et à la mise en œuvre de cette architecture, en présentant les aspects d'implémentation et les résultats obtenus sur l'ensemble de test.

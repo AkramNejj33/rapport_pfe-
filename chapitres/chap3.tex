@@ -247,7 +247,7 @@ Parmi les modèles d'embedding de référence, on distingue :
 \begin{itemize}
     \item \textbf{all-MiniLM-L6-v2 \cite{logo:sentence_transformers} :} Un modèle compact offrant un bon équilibre entre qualité des embeddings (384 dimensions) et vitesse d'inférence sur CPU. Particulièrement adapté aux environnements contraints en ressources computationnelles.
     \item \textbf{E5 (Microsoft) \cite{logo:e5} :} Une famille de modèles optimisés pour la recherche sémantique et le reranking, entraînés sur de vastes corpus de paires textuelles.
-    \item \textbf{voyage-multilingual-2 (Voyage AI) \cite{logo:snowflake_cortex} :} Un modèle multilingue de haute performance couvrant plus de 30 langues, particulièrement adapté aux corpus techniques comportant des termes issus de plusieurs langues.
+    \item \textbf{snowflake-arctic-embed-m \cite{logo:snowflake_cortex} :} Un modèle développé par Snowflake, intégré nativement à Snowflake Cortex, produisant des vecteurs de 768 dimensions. Optimisé pour la recherche sémantique sur des textes techniques, il s'exécute directement via la fonction SQL \texttt{EMBED\_TEXT\_768()} sans aucun transfert de données hors de l'environnement Snowflake.
     \item \textbf{text-embedding-3-large (OpenAI) \cite{logo:openai} :} Un modèle propriétaire accessible via API, produisant des vecteurs de 3072 dimensions avec des performances de pointe sur les benchmarks MTEB.
 \end{itemize}
 
@@ -430,7 +430,7 @@ Des approches plus récentes ont démontré que des modèles BERT fine-tunés su
 
 Des travaux plus récents explorent l'utilisation directe des LLM pour la classification de tickets. Kochhar et al. \cite{logo:kochhar2014} ont étudié la reclassification fine des rapports d'incidents, montrant que des descripteurs structurés permettent d'automatiser cette tâche de manière fiable. Les approches zero-shot et few-shot sur GPT-4 montrent des performances comparables au fine-tuning de BERT sur plusieurs benchmarks de classification d'issues, sans nécessiter de données annotées \cite{logo:llm_bug_report}.
 
-L'approche RAG appliquée aux tickets a été explorée dans plusieurs travaux récents \cite{logo:advanced_rag}. Elle permet d'ancrer les prédictions sur des tickets historiques similaires, améliorant la cohérence et la traçabilité des classifications. Le recours à un mécanisme de seuil de confiance pour arbitrer entre la voie rapide (similarité directe) et l'appel au LLM est une optimisation permettant de concilier coût et qualité.
+L'approche RAG appliquée aux tickets a été explorée dans plusieurs travaux récents \cite{logo:advanced_rag}. Elle permet d'ancrer les prédictions sur des tickets historiques similaires, améliorant la cohérence et la traçabilité des classifications. Des variantes intègrent un re-ranking hybride combinant similarité sémantique et correspondance lexicale, afin de corriger les biais de la seule similarité cosinus sur les termes techniques discriminants.
 
 \subsection{Travaux spécifiques sur Apache Spark}
 
@@ -488,19 +488,21 @@ Trois grandes approches permettent d'intégrer des capacités LLM dans un pipeli
 \centering
 \begin{tabularx}{\textwidth}{|l|X|X|X|}
   \hline
-  \textbf{Critère} & \textbf{Snowflake Cortex} & \textbf{APIs externes (OpenAI, Anthropic)} & \textbf{Bibliothèques locales (HuggingFace)} \\
+  \textbf{Critère} & \textbf{Snowflake Cortex} & \textbf{APIs externes (OpenAI, Anthropic)} & \textbf{Déploiement local (Ollama, HuggingFace)} \\
   \hline
   Sortie de données & Non (données restent dans Snowflake) & Oui (envoi au fournisseur) & Non (tout local) \\
   \hline
   Taille des modèles & Grands modèles (70B+) & Très grands (GPT-4, Claude 3) & Limité par la RAM/GPU \\
   \hline
-  Latence & Faible (réseau interne) & Variable (réseau public) & Faible (modèles légers) \\
+  Latence & Faible (réseau interne) & Variable (réseau public) & Faible si GPU, lente sur CPU \\
   \hline
-  Coût & Crédits Snowflake & Facturation à l'appel (tokens) & Gratuit (hors GPU) \\
+  Coût & Crédits Snowflake & Facturation à l'appel (tokens) & Gratuit (hors infrastructure GPU) \\
   \hline
   Intégration SQL & Native & Non & Non \\
   \hline
   Conformité & Élevée & Dépend des CGU du fournisseur & Maximale \\
+  \hline
+  \rowcolor{headerblue} Retenu & \checkmark & & \\
   \hline
 \end{tabularx}
 \caption{Comparaison des approches d'inférence LLM dans un pipeline de données}
@@ -536,7 +538,7 @@ L'ensemble technologique retenu pour ce projet repose sur quatre piliers complé
 
 \textbf{dbt \cite{logo:dbt}} comme outil de transformation. Son approche SQL déclarative, ses mécanismes de test et de documentation intégrés, et sa gestion des dépendances via DAG en font l'outil le plus rigoureux pour construire un pipeline de transformation reproductible et maintenable.
 
-\textbf{Snowflake Cortex \cite{logo:snowflake_cortex}} pour les fonctions d'IA. Il permet d'exécuter des modèles de langage (Mistral Large 2 \cite{logo:mistral}, Llama 3.1-70B \cite{logo:llama}) et de calculer des embeddings multilingues directement depuis SQL, garantissant la confidentialité des données et simplifiant l'architecture.
+\textbf{Snowflake Cortex \cite{logo:snowflake_cortex}} pour l'ensemble des fonctions d'IA. Il permet d'exécuter les modèles \texttt{mistral-large2} \cite{logo:mistral} pour la summarization et l'extraction de mots clés, \texttt{snowflake-arctic-embed-m} pour les embeddings 768 dimensions, et \texttt{llama3.3-70b} \cite{logo:llama} pour la classification few-shot et la génération de résumés correctifs, le tout directement depuis SQL sans aucun transfert de données hors de Snowflake.
 
 \textbf{Streamlit \cite{logo:streamlit}} pour la restitution. Son intégration native avec Snowflake et sa capacité à produire des interfaces interactives en Python le rendent idéal pour exposer les prédictions et les analyses aux utilisateurs finaux sans infrastructure web dédiée.
 
