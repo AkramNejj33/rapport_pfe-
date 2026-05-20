@@ -1,0 +1,301 @@
+\chapter{Conception du système}
+
+\rhead{Conception du système}
+\lfoot{\leftmark}
+
+\section{Introduction}
+Ce chapitre présente la conception de la plateforme de triage automatique des incidents Apache Spark. Après avoir étudié les choix technologiques dans le chapitre précédent, nous nous concentrons ici sur l'organisation concrète du système. Nous commençons par une analyse approfondie du jeu de données exploité, en décrivant sa structure, ses volumes et ses spécificités. Nous présentons ensuite la modélisation du processus de traitement à travers l'architecture en médaillon mise en œuvre avec dbt et Snowflake. Enfin, nous décrivons l'architecture générale du système, en détaillant les composants d'intelligence artificielle qui constituent le cœur de la plateforme : le pipeline de classification hybride fondé sur les embeddings de transformers, le mécanisme de routage par confiance et l'arbitrage par modèle de langage.
+
+%--------------------------2-----------------------------
+\section{Analyse et description du jeu de données}
+
+\subsection{Origine et nature des données}
+
+Il convient de souligner que la plateforme développée dans le cadre de ce stage est déployée en environnement de production au sein de SQLI, où elle traite des données réelles issues des tickets d'un client de l'entreprise. Cependant, des obligations contractuelles de confidentialité interdisent la divulgation de ces données ainsi que la présentation de résultats obtenus à partir de celles-ci dans un document académique. Afin de permettre la validation scientifique de l'approche et d'assurer la reproductibilité des résultats présentés dans ce rapport, un jeu de données public de nature et de structure équivalentes a été retenu comme support de démonstration. Il s'agit d'un export du gestionnaire de tickets JIRA de la fondation Apache, mis à disposition sur la plateforme Kaggle en mars 2025. Cet export couvre l'ensemble des projets hébergés par la fondation Apache, représentant un volume brut d'environ 8,7 gigaoctets de données tabulaires au format CSV. Conformément au périmètre du projet, seuls les tickets associés au projet Apache Spark ont été retenus, soit environ 49 832 tickets sur un total de plus d'un million d'entrées dans le fichier d'issues. Ce filtrage est appliqué dès la première couche de transformation par la condition \texttt{project\_key = 'SPARK'}.
+
+Les données sont réparties en quatre fichiers sources distincts, chacun représentant une entité du système JIRA. Ces fichiers entretiennent des relations entre eux via les identifiants de tickets, permettant de reconstituer le cycle de vie complet d'un incident, depuis sa création jusqu'à sa résolution.
+
+\subsection{Description des fichiers sources}
+
+Le tableau \ref{tab:dataset} présente les quatre fichiers sources composant le jeu de données, avec leurs volumes respectifs et les informations qu'ils contiennent.
+
+\begin{table}[h!]
+\centering
+\begin{tabularx}{\textwidth}{|c|c|X|}
+  \hline
+  \textbf{Fichier} & \textbf{Nombre de lignes} & \textbf{Contenu principal} \\
+  \hline
+  issues.csv & 1 149 321 & Tickets de tous les projets Apache : résumé, description, type d'incident, résolution, priorité, statut, reporter, assignataire, dates de création et de mise à jour \\
+  \hline
+  comments.csv & 5 047 714 & Commentaires associés aux tickets : auteur, corps du commentaire, horodatage \\
+  \hline
+  changelog.csv & 9 653 526 & Journal des modifications de chaque ticket : champ modifié, valeur avant, valeur après, auteur, date de la modification \\
+  \hline
+  issuelinks.csv & 390 063 & Relations inter-tickets : type de lien (blocks, duplicates, relates to, etc.), ticket source, ticket cible \\
+  \hline
+\end{tabularx}
+\caption{Description des fichiers sources du jeu de données}
+\label{tab:dataset}
+\end{table}
+
+\subsection{Structure et caractéristiques des tickets}
+
+Chaque ticket Apache Spark est décrit par un ensemble de champs structurés et semi-structurés. Les champs structurés comprennent l'identifiant unique du ticket (clé JIRA de la forme SPARK-XXXXX), le type d'incident (\textit{issuetype}), la résolution (\textit{resolution}), la priorité (\textit{priority}), le statut courant (\textit{status}), ainsi que les informations relatives aux utilisateurs impliqués (reporter et assignataire).
+
+Les champs textuels constituent la principale source d'information sémantique. Le résumé (\textit{summary}) offre une description synthétique en une ligne, tandis que la description (\textit{description}) peut contenir plusieurs paragraphes incluant des extraits de code, des traces d'exécution (stack traces), des liens vers des ressources externes et des balises HTML issues de l'interface JIRA. Ces particularités imposent un traitement NLP spécifique avant toute exploitation par le pipeline de classification.
+
+\subsection{Normalisation des étiquettes de classification}
+
+L'objectif du pipeline est de prédire deux cibles pour chaque nouveau ticket : le type d'incident (\textit{issuetype}) et la résolution probable (\textit{resolution}). Or, dans les données brutes, ces champs présentent une hétérogénéité importante due à des valeurs saisies librement par les contributeurs au fil des années.
+
+Pour le type d'incident, on dénombre 22 valeurs brutes distinctes, dont certaines sont redondantes ou marginales. Une table de correspondance (\textit{issuetype\_mapping.csv}), intégrée comme \textit{seed} dbt, les regroupe en 9 classes normalisées couvrant les catégories principales : Bug, Improvement, New Feature, Task, Sub-task, Test, Wish, Question et Documentation.
+
+Pour la résolution, 15 valeurs brutes sont normalisées en 7 classes via la table \textit{resolution\_mapping.csv} : Fixed, Won't Fix, Duplicate, Cannot Reproduce, Not A Problem, Later et Incomplete.
+
+\subsection{Découpage temporel et volume final}
+
+Afin de garantir une évaluation rigoureuse du pipeline de classification, les données Apache Spark sont partitionnées selon l'axe temporel de création du ticket. Ce découpage évite toute contamination entre les ensembles d'entraînement et d'évaluation, les tickets les plus récents étant inconnus lors de l'apprentissage. Le tableau \ref{tab:split} détaille la répartition des tickets entre les trois ensembles.
+
+\begin{table}[h!]
+\centering
+\begin{tabularx}{\textwidth}{|c|X|X|}
+  \hline
+  \textbf{Ensemble} & \textbf{Période de création} & \textbf{Rôle} \\
+  \hline
+  Entraînement & Avant 2022 & Base de référence pour la recherche par similarité vectorielle \\
+  \hline
+  Validation & Année 2022 & Calibration des hyperparamètres (k, seuils de confiance, poids des boosts) \\
+  \hline
+  Test & Année 2023 & Évaluation finale, utilisé une seule fois après verrouillage des paramètres \\
+  \hline
+  Exclu & Données incomplètes ou ambiguës & Non utilisé dans le pipeline \\
+  \hline
+\end{tabularx}
+\caption{Découpage temporel du jeu de données Apache Spark}
+\label{tab:split}
+\end{table}
+
+Après application de l'ensemble des règles de filtrage et de nettoyage, le volume final traité dans la table intermédiaire \textit{INT\_ISSUES\_CLEANED} s'élève à 45 043 tickets, auxquels sont associés 41 986 enregistrements de commentaires agrégés, 29 937 entrées de caractéristiques issues du journal de modifications et 11 179 enregistrements de caractéristiques de liens inter-tickets.
+
+%--------------------------3-----------------------------
+\section{Modélisation du processus de traitement}
+
+\subsection{Vue d'ensemble : architecture en médaillon}
+
+Le processus de traitement des données est structuré selon l'architecture en médaillon, organisée en trois couches de qualité croissante au sein de la base de données Snowflake \textit{PFE\_SPARK}. Chaque couche correspond à un niveau de maturité de la donnée, depuis l'ingestion brute jusqu'aux tables de consommation finales. L'ensemble des transformations est orchestré par dbt, qui gère les dépendances entre les modèles sous forme de graphe acyclique dirigé (DAG) et garantit l'exécution des tests automatisés à chaque étape. La figure \ref{fig:medallion_flow} illustre l'enchaînement des couches et les schémas Snowflake correspondants.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/medallion_flow.png}
+    \caption{Architecture en médaillon du processus de traitement}
+    \label{fig:medallion_flow}
+\end{figure}
+
+\subsection{Couche Bronze : ingestion brute}
+
+La couche Bronze constitue le point d'entrée des données dans la plateforme. Les quatre fichiers CSV sources sont chargés dans Snowflake en deux étapes. La commande \texttt{PUT} transfère les fichiers compressés depuis le système de fichiers local vers le stage interne Snowflake. La commande \texttt{COPY INTO} exécute ensuite l'ingestion vers les tables cibles. Toutes les colonnes sont stockées au format \texttt{VARCHAR}, reproduisant fidèlement la structure CSV d'origine grâce à un mapping positionnel (\texttt{\$N}). Aucune transformation métier n'est appliquée à ce stade, préservant ainsi un historique immuable qui permet de retraiter les couches supérieures à tout moment sans dépendre de la source originale.
+
+\subsection{Couche Argent — Staging : filtrage mécanique}
+
+La couche Staging est implémentée sous forme de vues dbt directement au-dessus des tables Bronze. Son rôle est de réaliser un ensemble d'opérations mécaniques de préparation : filtrage des tickets au seul projet Apache Spark, renommage des colonnes selon les conventions du projet, transtypage vers les types natifs Snowflake (entiers, dates, booléens) et déduplication. Pour le journal de modifications, un filtre supplémentaire est appliqué afin de ne retenir que les changements portant sur les champs métier pertinents : statut, priorité, résolution, assignataire et type d'incident. Ce filtrage réduit le volume du changelog de 9,6 millions à environ 400 000 entrées exploitables.
+
+\subsection{Couche Argent — Intermédiaire : logique métier et ingénierie des caractéristiques}
+
+La couche Intermédiaire porte l'essentiel de la valeur ajoutée du processus de traitement. Elle est implémentée sous forme de tables dbt matérialisées, calculées à partir des vues de Staging.
+
+\subsubsection{Nettoyage textuel et normalisation des étiquettes}
+
+Le modèle \textit{INT\_ISSUES\_CLEANED} applique une macro dbt de nettoyage NLP en six étapes successives sur les champs textuels : suppression des balises HTML, retrait des blocs de code délimités par des backticks, élimination des mentions d'utilisateurs (format @username), suppression des URLs, normalisation des espaces multiples, et mise en minuscule. En parallèle, les étiquettes brutes de type et de résolution sont remplacées par leurs valeurs normalisées via les seeds dbt \textit{issuetype\_mapping} et \textit{resolution\_mapping}. Enfin, une colonne \textit{split} est calculée pour chaque ticket selon sa date de création, affectant la valeur \textit{train} (avant 2022), \textit{val} (2022) ou \textit{test} (2023).
+
+\subsubsection{Agrégation des commentaires}
+
+Le modèle \textit{INT\_COMMENTS\_AGGREGATED} consolide les commentaires de chaque ticket selon la politique « premiers 5 + derniers 3 ». Cette heuristique capture à la fois le contexte initial de signalement, généralement exprimé dans les premiers échanges, et les éléments de résolution, qui apparaissent naturellement en fin de fil de discussion. Le texte agrégé résultant est intégré dans la vue enrichie du ticket (\textit{text\_rich}), qui constitue la seconde entrée du pipeline d'embedding.
+
+\subsubsection{Extraction des caractéristiques du journal de modifications}
+
+Le modèle \textit{INT\_CHANGELOG\_FEATURES} extrait des indicateurs comportementaux à partir du journal des modifications. L'indicateur \textit{was\_escalated} détecte si la priorité d'un ticket a été revue à la hausse au cours de son cycle de vie. Son calcul repose sur un mapping des étiquettes de priorité vers des entiers ordonnés (Blocker~=~4, Critical~=~3, Major~=~2, Minor~=~1, Trivial~=~0), permettant une comparaison numérique correcte que la comparaison alphabétique des chaînes de caractères ne permettrait pas. L'indicateur complémentaire \textit{was\_deescalated} capte le phénomène de baisse de priorité. L'indicateur \textit{n\_assignee\_changes} comptabilise le nombre de réassignations successives, signal révélateur de la complexité ou de l'ambiguïté du ticket. Ces caractéristiques sont utilisées comme signal de reranking dans le pipeline de classification.
+
+\subsubsection{Caractéristiques des liens inter-tickets}
+
+Le modèle \textit{INT\_ISSUELINKS\_FEATURES} calcule pour chaque ticket le nombre total de liens entrants et sortants ainsi que la distribution par type de lien (blocks, duplicates, relates to). Ces métriques fournissent une mesure de la connectivité du ticket dans le graphe des incidents, un signal complémentaire aux informations textuelles.
+
+\subsection{Couche Or : tables de consommation}
+
+La couche Or produit les tables finales destinées à la consommation par le pipeline de classification et par les applications de restitution.
+
+\subsubsection{Mart Machine Learning}
+
+La table \textit{MART\_ML}, hébergée dans le schéma \textit{MARTS\_ML}, constitue le contrat d'interface entre la couche de transformation et le pipeline Python. Elle consolide, pour chaque ticket, deux représentations textuelles complémentaires :
+
+\begin{itemize}
+    \item \textbf{text\_noco} : vue minimale du ticket composée du résumé, de la priorité, du statut et du reporter, sans aucune information pouvant agir comme indice sur l'étiquette cible. Cette représentation est conçue pour capturer l'essence du problème signalé.
+    \item \textbf{text\_rich} : vue enrichie intégrant les commentaires agrégés et les métadonnées structurées (nombre de commentaires, nombre de liens, indicateurs de changelog). Cette représentation vise à capturer le contexte de résolution.
+\end{itemize}
+
+La table inclut également les étiquettes normalisées (\textit{issuetype\_norm}, \textit{resolution\_norm}), la colonne \textit{split} pour le découpage train/validation/test, et les caractéristiques numériques de changelog.
+
+\subsubsection{Marts Analytiques}
+
+Trois tables sont produites dans le schéma \textit{MARTS\_ANALYTICS} pour alimenter le tableau de bord :
+
+\begin{itemize}
+    \item \textbf{MART\_ANALYTICS\_OPS} : agrégats mensuels par type d'incident, couvrant l'ensemble des années disponibles sans restriction au seul ensemble d'entraînement.
+    \item \textbf{MART\_ANALYTICS\_WORKLOAD} : métriques de charge par assignataire (volume de tickets assignés, délai médian de résolution, taux de clôture).
+    \item \textbf{MART\_ANALYTICS\_LINKS} : métriques de connectivité par ticket (degré de liens entrants et sortants, présence de liens de blocage).
+\end{itemize}
+
+\subsection{Garanties de qualité}
+
+L'ensemble du pipeline de transformation est couvert par une suite de plus de 50 tests dbt automatisés, répartis sur toutes les couches. Ces tests vérifient l'unicité des clés primaires, l'absence de valeurs nulles sur les colonnes critiques, la conformité des étiquettes normalisées aux valeurs attendues (incluant la valeur "Won't Fix"), et des contraintes de plage pour les indicateurs numériques. L'exécution de la commande \texttt{dbt test} produit un résultat sans aucun avertissement ni erreur, garantissant l'intégrité de la donnée à chaque étape du processus.
+
+%--------------------------4-----------------------------
+\section{Architecture générale du système}
+
+\subsection{Vue d'ensemble}
+
+La plateforme se décompose en quatre blocs fonctionnels qui s'articulent de manière séquentielle : la couche d'ingestion, la couche de transformation décrite dans la section précédente, le pipeline de classification hybride fondé sur l'intelligence artificielle, et la couche de restitution. La figure \ref{fig:archi_generale} illustre les flux de données entre ces composants et positionne chaque brique technologique dans l'architecture globale.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/architecture_generale.png}
+    \caption{Architecture générale de la plateforme de triage automatique}
+    \label{fig:archi_generale}
+\end{figure}
+
+\subsection{Composants d'intelligence artificielle : vue d'ensemble}
+
+L'intelligence artificielle intervient à trois niveaux distincts dans la plateforme, chacun mobilisant un type de modèle différent et répondant à un besoin précis.
+
+Le premier niveau est celui de la \textbf{représentation sémantique}, assuré par un modèle d'embedding de type transformer. Ce modèle transforme chaque ticket, exprimé sous forme de texte libre, en un vecteur dense de 1024 dimensions qui encode son sens sémantique. Deux représentations vectorielles sont calculées par ticket, l'une centrée sur le problème (NOCO) et l'autre sur le contexte de résolution (RICH).
+
+Le deuxième niveau est celui de la \textbf{classification par similarité}, réalisé sans apprentissage supervisé classique. La prédiction repose sur la recherche des tickets historiques les plus similaires dans l'espace vectoriel, suivie d'un vote pondéré sur leurs étiquettes connues. Cette approche, inspirée des méthodes k-plus-proches-voisins mais opérée dans un espace sémantique dense, tire parti de la totalité de la base d'entraînement sans jamais figer un modèle de classification.
+
+Le troisième niveau est celui de l'\textbf{arbitrage par grand modèle de langage (LLM)}, activé uniquement pour les cas où la confiance du vote est insuffisante. Le LLM reçoit le ticket ambigu et les candidats proches, raisonne sur leur comparaison et propose une étiquette, dont la validité est ensuite garantie par contrainte syntaxique.
+
+\subsection{Pipeline de classification hybride }
+
+Le pipeline de classification, nommé  Hybrid RCA (Root Cause Analysis), constitue le cœur intelligent du système. Il reçoit en entrée la représentation textuelle d'un ticket et produit une prédiction du type d'incident, une prédiction de la résolution probable, un tag de routage et un résumé correctif. La figure \ref{fig:ml_pipeline} détaille les étapes internes du pipeline.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{images/pipeline_ml_v6.png}
+    \caption{Étapes internes du pipeline de classification hybride}
+    \label{fig:ml_pipeline}
+\end{figure}
+
+\subsubsection{Le modèle d'embedding : BAAI/bge-large-en-v1.5}
+
+Le pipeline repose sur le modèle \texttt{BAAI/bge-large-en-v1.5}, un encodeur de phrases (sentence encoder) basé sur l'architecture transformer BERT, développé par le Beijing Academy of Artificial Intelligence. Ce modèle produit, pour une séquence textuelle de longueur quelconque, un vecteur dense de 1024 dimensions représentant son contenu sémantique.
+
+Son fonctionnement interne repose sur le mécanisme d'attention multi-têtes propre aux transformers. Chaque token de la séquence d'entrée est mis en relation avec l'ensemble des autres tokens via des calculs d'attention, permettant au modèle de capturer des dépendances longue portée et des nuances contextuelles inaccessibles aux représentations classiques telles que TF-IDF ou les sacs de mots. La représentation finale du ticket est obtenue par un pooling (moyenne pondérée ou token [CLS]) sur les vecteurs de sortie de la dernière couche du transformer.
+
+Le modèle \texttt{bge-large-en-v1.5} a été retenu pour plusieurs raisons convergentes. Premièrement, il figure en tête du classement MTEB (Massive Text Embedding Benchmark) sur les tâches de recherche sémantique en anglais, ce qui est directement pertinent pour la recherche de tickets similaires. Deuxièmement, ses 1024 dimensions correspondent exactement à celles spécifiées dans l'architecture Snowflake Cortex de référence (\texttt{voyage-multilingual-2}), garantissant une compatibilité directe si le déploiement bascule vers le pipeline SQL natif. Troisièmement, il peut s'exécuter localement sur CPU, sans infrastructure GPU, ce qui respecte les contraintes de l'environnement de développement. Quatrièmement, il est distribué sous licence libre via la bibliothèque \textit{sentence-transformers} de Hugging Face, sans coût d'inférence.
+
+\subsubsection{Stratégie des embeddings doubles : NOCO et RICH}
+
+Une innovation centrale du pipeline est l'exploitation de deux représentations vectorielles distinctes pour chaque ticket de la base d'entraînement, reflétant deux perspectives complémentaires sur le même incident.
+
+\textbf{L'embedding NOCO} (No-Context) est calculé sur la colonne \textit{text\_noco}, une vue minimale du ticket composée du résumé nettoyé, de la priorité, du statut et du reporter. Cette représentation est intentionnellement dépourvue de tout signal lié à la résolution ou aux commentaires. Elle est conçue pour capturer l'essence du problème signalé tel qu'il apparaît au moment de sa création, permettant une recherche fondée sur la nature intrinsèque du ticket.
+
+\textbf{L'embedding RICH} est calculé sur la colonne \textit{text\_rich}, une vue enrichie intégrant les commentaires agrégés selon la politique premiers-5 + derniers-3, ainsi que les métadonnées structurées numériques. Cette représentation encode le contexte de résolution : les échanges entre contributeurs, les investigations menées, les décisions prises. Elle est conçue pour identifier des tickets qui ont suivi un parcours de résolution similaire, même si leur formulation initiale était différente.
+
+Pour un nouveau ticket soumis à l'inférence, seul l'embedding NOCO peut être calculé à la volée (les commentaires n'existant pas encore). L'embedding RICH est donc uniquement utilisé côté base d'entraînement, où il contribue à enrichir le voisinage retrouvé par l'embedding NOCO du ticket entrant. Cette asymétrie est délibérée et constitue l'un des apports architecturaux du pipeline.
+
+\subsubsection{Recherche par similarité cosinus et fusion RRF}
+
+Une fois les deux embeddings NOCO et RICH calculés pour l'ensemble de la base d'entraînement et persistés sous forme de matrices NumPy (\textit{embeddings\_noco.npz} et \textit{embeddings\_rich.npz}), la phase de recherche consiste à trouver les tickets les plus proches du ticket entrant dans chacun des deux espaces vectoriels.
+
+La similarité cosinus est utilisée comme métrique de distance. Pour deux vecteurs $\mathbf{a}$ et $\mathbf{b}$ de dimension 1024, elle est définie par :
+
+$$\text{sim}(\mathbf{a}, \mathbf{b}) = \frac{\mathbf{a} \cdot \mathbf{b}}{\|\mathbf{a}\| \cdot \|\mathbf{b}\|}$$
+
+Cette métrique est particulièrement adaptée aux embeddings de transformers, car elle est insensible à la norme des vecteurs et mesure uniquement l'alignement directionnel dans l'espace sémantique.
+
+Les deux recherches (NOCO et RICH) produisent deux listes de candidats ordonnées par score décroissant. Ces listes sont ensuite fusionnées par la technique \textbf{Reciprocal Rank Fusion (RRF)}. Pour chaque ticket candidat $d$, son score RRF est calculé comme :
+
+$$\text{RRF}(d) = \sum_{i \in \{\text{NOCO, RICH}\}} \frac{1}{k + r_i(d)}$$
+
+où $r_i(d)$ est le rang du candidat $d$ dans la liste $i$ et $k = 60$ est une constante d'amortissement. Cette formulation présente l'avantage d'être robuste aux différences d'échelle entre les scores des deux espaces et de ne pas nécessiter leur normalisation. Les 30 meilleurs candidats selon le score RRF sont retenus pour l'étape suivante.
+
+\subsubsection{Reclassement par caractéristiques structurées}
+
+Un score de fusion final (\textit{fused\_score}) est calculé pour chacun des 30 candidats en combinant le score RRF avec deux signaux supplémentaires issus des couches de transformation :
+
+\begin{itemize}
+    \item \textbf{Boost de métadonnées} : une similitude est calculée entre le ticket entrant et chaque candidat sur les champs structurés (priorité, statut, reporter). Ce boost récompense les candidats dont le contexte opérationnel est similaire à celui du ticket à analyser.
+    \item \textbf{Similarité de caractéristiques de changelog} : une distance euclidienne normalisée est calculée entre les vecteurs de caractéristiques de changelog (\textit{was\_escalated}, \textit{was\_deescalated}, \textit{n\_assignee\_changes}) du ticket entrant et de chaque candidat, permettant de favoriser les tickets ayant connu des patterns comportementaux similaires.
+\end{itemize}
+
+Les 15 candidats présentant le meilleur \textit{fused\_score} constituent le voisinage final utilisé pour la prédiction, offrant un équilibre entre pertinence sémantique et cohérence structurelle.
+
+\subsubsection{Vote pondéré et signaux de confiance}
+
+La prédiction est obtenue par un vote pondéré sur les étiquettes des 15 voisins, en utilisant le \textit{fused\_score} comme poids. Ce mécanisme est analogue à un k-NN pondéré, mais opéré dans un espace sémantique riche et avec des poids multi-signaux. Trois indicateurs de confiance sont extraits de la distribution des votes :
+
+\begin{itemize}
+    \item \textbf{l0\_conf} : part du vote cumulé détenue par la classe prédite. Une valeur de 0,72 signifie que la classe gagnante concentre 72\% du vote total pondéré.
+    \item \textbf{l0\_div} : score de diversité défini comme $1 - H_{\text{norm}}$, où $H_{\text{norm}}$ est l'entropie normalisée de la distribution des votes. Une valeur proche de 1 traduit un consensus fort, une valeur proche de 0 une distribution diffuse.
+    \item \textbf{margin} : écart normalisé entre la classe gagnante et la deuxième classe, défini comme $\frac{v_1 - v_2}{v_{\text{total}}}$. Ce signal capture le caractère décisif du vote indépendamment du niveau absolu de confiance.
+\end{itemize}
+
+\subsection{Mécanisme de routage par confiance}
+
+Le mécanisme de routage constitue l'élément différenciateur de l'architecture par rapport aux approches de classification classiques. Son principe est de moduler dynamiquement le recours au modèle de langage selon la fiabilité estimée du vote par similarité, évitant ainsi les appels LLM coûteux lorsque la réponse est évidente, tout en garantissant la qualité des prédictions sur les cas ambigus.
+
+\subsubsection{Décision de routage}
+
+Lorsque les trois signaux de confiance \textit{l0\_conf}, \textit{l0\_div} et \textit{margin} sont simultanément supérieurs à leurs seuils respectifs, calibrés sur l'ensemble de validation, la prédiction est émise directement avec le tag \textbf{DIRECT}. Le ticket est considéré comme suffisamment ancré dans un voisinage homogène pour que le vote seul soit fiable.
+
+Dans le cas contraire, le ticket est marqué \textbf{LLM\_REQUIRED} et transmis au module d'arbitrage par grand modèle de langage. Cette situation survient typiquement lorsque les 15 voisins sont répartis entre plusieurs classes sans majorité claire, ou lorsque le ticket est sémantiquement éloigné de tous les exemples connus.
+
+\subsubsection{Arbitrage par modèle de langage}
+
+Le module d'arbitrage (\textit{cortex/arbitration.py}) met en œuvre une stratégie de few-shot prompting pour solliciter le raisonnement du LLM. Le prompt soumis au modèle comprend :
+
+\begin{itemize}
+    \item Le texte nettoyé du ticket à classifier (résumé + description).
+    \item Les cinq candidats les plus proches avec leurs étiquettes de type et de résolution, ainsi que leurs résumés correctifs (\textit{fix\_summary}).
+    \item L'ensemble des étiquettes valides entre lesquelles le modèle doit choisir.
+    \item Une instruction explicite de répondre uniquement par une étiquette de la liste fournie.
+\end{itemize}
+
+La réponse brute du modèle est ensuite normalisée vers l'ensemble valide d'étiquettes par \textbf{distance d'édition} (algorithme de Levenshtein via la bibliothèque \textit{rapidfuzz}). Cette étape de contrainte syntaxique est essentielle car elle garantit que la sortie du LLM correspond toujours à une catégorie reconnue, même si le modèle introduit une faute de frappe ou une légère reformulation. La prédiction résultante est taggée \textbf{LLM\_ARBITRATED}.
+
+\subsubsection{Client LLM agnostique au backend}
+
+Le client LLM (\textit{cortex/llm\_client.py}) est conçu pour être agnostique au backend d'inférence. Il implémente une logique de basculement automatique : en l'absence de clé API Anthropic, le modèle \texttt{mistral:7b} est sollicité via Ollama en mode local, permettant un fonctionnement entièrement hors ligne sans coût d'inférence. Si la variable d'environnement \texttt{ANTHROPIC\_API\_KEY} est configurée, le client bascule vers l'API Anthropic avec le modèle \texttt{claude-haiku-4-5}, offrant une capacité de raisonnement supérieure pour les cas les plus complexes. Cette architecture agnostique garantit la reproductibilité du pipeline indépendamment de l'infrastructure disponible.
+
+\subsection{Génération de résumés correctifs par LLM}
+
+Pour chaque prédiction, le système génère un résumé correctif court (\textit{fix\_summary}) décrivant en une à deux phrases comment des tickets similaires ont été résolus dans le passé. Ce composant (\textit{cortex/fix\_summary.py}) mobilise le LLM pour synthétiser, à partir du texte et des métadonnées d'un ticket d'entraînement déjà résolu, l'essentiel de la démarche de correction.
+
+La génération suit une stratégie \textbf{paresseuse et mise en cache}. Les résumés ne sont générés que pour les tickets effectivement récupérés lors d'une requête d'inférence, évitant ainsi de prétraiter l'ensemble des 45 000 tickets d'entraînement. Une fois généré, chaque résumé est persisté dans un fichier JSON local (\textit{results/fix\_summaries.json}) et dans la table Snowflake \textit{CORTEX.TRAIN\_ENRICHED}. Lors des requêtes suivantes, les résumés déjà calculés sont servis depuis le cache sans appel supplémentaire au LLM.
+
+Cette conception permet d'enrichir progressivement la base de connaissances au fil des utilisations, tout en maintenant un coût d'inférence LLM proportionnel à l'activité réelle de la plateforme et non au volume total des données d'entraînement.
+
+\subsection{Couche de restitution}
+
+La plateforme expose deux applications Streamlit conteneurisées via Docker, chacune répondant à un profil d'usage distinct.
+
+\subsubsection{Application d'inférence en temps réel}
+
+L'application d'inférence (\textit{apps/inference/}), accessible sur le port 8501, permet le triage en temps réel d'un nouveau ticket. L'utilisateur saisit le résumé, la description, la priorité et le statut du ticket. L'application effectue une validation des entrées, calcule les embeddings NOCO et RICH à la volée, exécute le pipeline de recherche et de vote, et affiche la prédiction du type et de la résolution avec le tag de routage (DIRECT ou LLM\_ARBITRATED) et le niveau de confiance sous forme numérique et visuelle. Un panneau dédié présente les résumés correctifs des tickets les plus proches, offrant aux développeurs un point de départ concret pour la résolution du problème signalé.
+
+\subsubsection{Tableau de bord analytique}
+
+L'application analytique (\textit{apps/analytics/}), accessible sur le port 8502, est une application multi-pages permettant l'exploration des données opérationnelles historiques. Elle est structurée en cinq pages complémentaires :
+
+\begin{itemize}
+    \item \textbf{Page 1 — Vue d'ensemble} : évolution mensuelle du volume de tickets et répartition par type d'incident, alimentée par \textit{MART\_ANALYTICS\_OPS}.
+    \item \textbf{Page 2 — Résolution} : analyse des délais de résolution et de la distribution des motifs de clôture.
+    \item \textbf{Page 3 — Charge de travail} : tableau de bord par assignataire (volume, délai médian, taux de clôture), exploitant \textit{MART\_ANALYTICS\_WORKLOAD}.
+    \item \textbf{Page 4 — Relations} : exploration des liens entre tickets et identification des composants les plus bloquants, exploitant \textit{MART\_ANALYTICS\_LINKS}.
+    \item \textbf{Page 5 — Anomalies} : détection de tickets présentant des patterns de changelog anormaux (forte rotation d'assignataires, reversals d'escalade de priorité, délais de résolution atypiques).
+\end{itemize}
+
+Toutes les requêtes Snowflake sont mises en cache avec un TTL d'une heure via le décorateur \texttt{@st.cache\_data(ttl=3600)}, afin de limiter la consommation de crédits du compte d'essai Snowflake tout en maintenant une expérience utilisateur fluide.
+
+%--------------------------5-----------------------------
+\section{Conclusion}
+
+Ce chapitre a posé les fondations de la conception de la plateforme de triage automatique. Nous avons présenté le jeu de données Apache JIRA dans sa structure, son volume et ses spécificités, avant de décrire en détail le processus de transformation qui, à travers l'architecture en médaillon pilotée par dbt, produit des tables de consommation fiables et validées par plus de 50 tests automatisés. Nous avons ensuite décrit l'architecture générale du système et détaillé les trois niveaux d'intervention de l'intelligence artificielle : la représentation sémantique dense par le modèle d'embedding \texttt{bge-large-en-v1.5}, la classification par similarité vectorielle avec fusion RRF et vote pondéré, et l'arbitrage par modèle de langage pour les cas ambigus. Le chapitre suivant sera consacré à la réalisation et à la mise en œuvre de cette architecture, en présentant les aspects d'implémentation et les résultats obtenus sur l'ensemble de test.

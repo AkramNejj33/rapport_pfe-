@@ -1,0 +1,30 @@
+
+\chapter*{Introduction générale}
+\stepcounter{page}
+\label{chap:intro}
+\addcontentsline{toc}{chapter}{\nameref{chap:intro}}
+\rhead{Introduction générale}
+\setlength{\parindent}{15pt}
+\rfoot{Page \thepage}
+\lfoot{}
+La transformation numérique des entreprises s'accompagne d'une croissance exponentielle du volume de données générées par les systèmes d'information. Dans le domaine du développement logiciel, les plateformes de suivi d'incidents telles que JIRA centralisent les signalements d'anomalies, les demandes d'amélioration et les tâches techniques. Pour les projets open source de grande envergure comme Apache Spark, qui compte près de 50 000 tickets accompagnés de millions de commentaires et d'entrées d'historique, le triage manuel de ces incidents devient difficilement soutenable.
+
+Face à ce constat, les avancées récentes en Big Data et en intelligence artificielle offrent la possibilité de construire des plateformes capables de traiter, d'enrichir et d'analyser ces données à grande échelle, tout en produisant des prédictions exploitables.
+
+C'est dans ce contexte que s'inscrit notre projet de fin d'études, réalisé au sein du département Data \& IA de l'agence SQLI Rabat. L'objectif est de concevoir et de mettre en œuvre une plateforme complète de triage automatique des incidents Apache Spark, reposant sur une architecture en médaillon hébergée sur Snowflake, orchestrée par dbt, et intégrant un pipeline de classification hybride combinant recherche par similarité vectorielle et arbitrage par modèle de langage via Snowflake Cortex. La plateforme produit, pour chaque ticket, une prédiction du type d'incident, une estimation de sa résolution probable et un résumé correctif exploitable par les équipes de développement.
+
+Ce rapport documente l’ensemble du processus de développement de la solution, depuis l’analyse initiale des besoins jusqu’à sa mise en œuvre finale. Il retrace les différentes étapes qui ont jalonné ma démarche : étude du besoin, exploration de l’existant, choix des outils, conception, tests, et validation.
+
+Il est structuré comme suit :
+
+\begin{description}
+    \item[ Chapitre 1 ] est consacré à une présentation de L’entreprise, le cadre général du stage et le parcours préparatoire réalisé en amont du projet.
+    
+    \item[Chapitre 2 ] présente le contexte général du projet, les objectifs visés, les spécifications fonctionnelles. Ce chapitre décrit également les outils de gestion de projet mis en place pour organiser efficacement le travail.
+    
+    \item[Chapitre 3 ] dresse un état de l'art des concepts et technologies liés au Big Data, en justifiant les choix technologiques retenus.
+    
+    \item[Chapitre 4 ] est dédié à la conception de la solution, incluant l’architecture technique, les choix de modélisation, et les flux de traitement.
+    
+    \item[Chapitre 5 ] décrit la réalisation et la mise en œuvre, en présentant l'implémentation détaillée et les résultats obtenus.
+\end{description}
